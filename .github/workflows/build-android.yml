@@ -21,19 +21,64 @@ jobs:
           fetch-depth: 1
 
       - name: Set up Godot environment
+        shell: bash
         run: |
           mkdir -v -p ~/.local/share/godot/export_templates
           mkdir -v -p ~/.config/godot
+
+          # Copy export templates from container
           if [ -d /root/.local/share/godot/export_templates/4.3.stable ]; then
             cp -r /root/.local/share/godot/export_templates/4.3.stable ~/.local/share/godot/export_templates/
           fi
-          if [ -f /root/.config/godot/editor_settings-4.tres ]; then
-            cp /root/.config/godot/editor_settings-4.tres ~/.config/godot/
+
+          # Locate Java SDK (Godot 4.3 requires this explicitly)
+          JAVA_PATH="$(dirname "$(dirname "$(readlink -f "$(which java)")")")"
+          if [ -z "$JAVA_PATH" ] || [ ! -d "$JAVA_PATH" ]; then
+            for c in /usr/lib/jvm/java-17-openjdk-amd64 /usr/lib/jvm/default-java /usr/lib/jvm/java-11-openjdk-amd64; do
+              if [ -d "$c" ]; then JAVA_PATH="$c"; break; fi
+            done
           fi
-          # Make debug keystore reachable
+          echo "JAVA_PATH=$JAVA_PATH"
+
+          # Locate Android SDK
+          ANDROID_PATH="${ANDROID_HOME:-/usr/lib/android-sdk}"
+          if [ ! -d "$ANDROID_PATH" ]; then
+            for c in /opt/android-sdk /opt/android /root/Android/Sdk /usr/local/android-sdk; do
+              if [ -d "$c" ]; then ANDROID_PATH="$c"; break; fi
+            done
+          fi
+          echo "ANDROID_PATH=$ANDROID_PATH"
+
+          # Ensure debug keystore exists at a known path
+          KEYSTORE_PATH="$HOME/debug.keystore"
           if [ -f /root/debug.keystore ]; then
-            cp /root/debug.keystore ~/debug.keystore
+            cp /root/debug.keystore "$KEYSTORE_PATH"
           fi
+          if [ ! -f "$KEYSTORE_PATH" ]; then
+            keytool -keyalg RSA -genkeypair -alias androiddebugkey \
+              -keypass android -keystore "$KEYSTORE_PATH" \
+              -storepass android -dname "CN=Android Debug,O=Android,C=US" \
+              -validity 9999 -deststoretype pkcs12
+          fi
+          echo "KEYSTORE_PATH=$KEYSTORE_PATH"
+
+          # Write a complete editor settings file with all paths Godot 4.3 needs.
+          # Use echo per-line so YAML indentation does NOT leak into the file content.
+          {
+            echo '[gd_resource type="EditorSettings" format=3]'
+            echo ''
+            echo '[resource]'
+            echo "export/android/android_sdk_path = \"${ANDROID_PATH}\""
+            echo "export/android/java_sdk_path = \"${JAVA_PATH}\""
+            echo "export/android/debug_keystore = \"${KEYSTORE_PATH}\""
+            echo 'export/android/debug_keystore_user = "androiddebugkey"'
+            echo 'export/android/debug_keystore_pass = "android"'
+            echo 'export/android/force_system_user = false'
+            echo 'export/android/shutdown_adb_on_exit = true'
+          } > ~/.config/godot/editor_settings-4.tres
+
+          echo "=== Final editor settings ==="
+          cat ~/.config/godot/editor_settings-4.tres
 
       - name: Diagnostic — show environment
         run: |

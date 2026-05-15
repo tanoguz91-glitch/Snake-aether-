@@ -11,6 +11,9 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: barichello/godot-ci:4.3
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -62,14 +65,17 @@ jobs:
           fi
 
       - name: Export Android APK
+        shell: bash
         run: |
           mkdir -v -p build
-          set -o pipefail
           godot --headless --verbose --export-debug "Android" "$PWD/build/snake-aether.apk" 2>&1 | tee /tmp/export.log
+          GODOT_EXIT=${PIPESTATUS[0]}
           echo "=== Export log tail ==="
           tail -200 /tmp/export.log
           echo "=== Build directory ==="
           ls -lah build/
+          echo "Godot exit code: $GODOT_EXIT"
+          exit $GODOT_EXIT
 
       - name: Upload APK artifact
         if: always()

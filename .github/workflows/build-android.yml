@@ -5,133 +5,206 @@ on:
     branches: [main, master]
   workflow_dispatch:
 
+env:
+  GODOT_VERSION: "4.3"
+  GODOT_STATUS: "stable"
+  PRESET_NAME: "Android"
+  APK_NAME: "snake-aether.apk"
+
 jobs:
-  export:
-    name: Build Snake Aether APK
+  build:
     runs-on: ubuntu-latest
-    container:
-      image: barichello/godot-ci:4.3
     defaults:
       run:
         shell: bash
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # --- Java 17 ---------------------------------------------------------
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
         with:
-          fetch-depth: 1
+          distribution: temurin
+          java-version: "17"
 
-      - name: Set up Godot environment
-        shell: bash
+      - name: Confirm Java
         run: |
-          mkdir -v -p ~/.local/share/godot/export_templates
-          mkdir -v -p ~/.config/godot
+          echo "JAVA_HOME=$JAVA_HOME"
+          ls -la "$JAVA_HOME/bin/java" "$JAVA_HOME/bin/javac"
+          java -version
+          javac -version
 
-          # Copy export templates from container
-          if [ -d /root/.local/share/godot/export_templates/4.3.stable ]; then
-            cp -r /root/.local/share/godot/export_templates/4.3.stable ~/.local/share/godot/export_templates/
-          fi
+      # --- Android SDK -----------------------------------------------------
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
 
-          # Locate Java SDK (Godot 4.3 requires this explicitly)
-          JAVA_PATH="$(dirname "$(dirname "$(readlink -f "$(which java)")")")"
-          if [ -z "$JAVA_PATH" ] || [ ! -d "$JAVA_PATH" ]; then
-            for c in /usr/lib/jvm/java-17-openjdk-amd64 /usr/lib/jvm/default-java /usr/lib/jvm/java-11-openjdk-amd64; do
-              if [ -d "$c" ]; then JAVA_PATH="$c"; break; fi
-            done
-          fi
-          echo "JAVA_PATH=$JAVA_PATH"
+      - name: Install Android SDK components
+        run: |
+          set -e
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-34" \
+            "build-tools;34.0.0" \
+            "cmdline-tools;latest" >/dev/null
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          ls "$ANDROID_HOME/build-tools" || true
+          ls "$ANDROID_HOME/platforms" || true
 
-          # Locate Android SDK
-          ANDROID_PATH="${ANDROID_HOME:-/usr/lib/android-sdk}"
-          if [ ! -d "$ANDROID_PATH" ]; then
-            for c in /opt/android-sdk /opt/android /root/Android/Sdk /usr/local/android-sdk; do
-              if [ -d "$c" ]; then ANDROID_PATH="$c"; break; fi
-            done
-          fi
-          echo "ANDROID_PATH=$ANDROID_PATH"
+      # --- Godot 4.3 binary -------------------------------------------------
+      - name: Download Godot ${{ env.GODOT_VERSION }}-${{ env.GODOT_STATUS }}
+        run: |
+          set -e
+          mkdir -p "$HOME/godot"
+          cd "$HOME/godot"
+          URL="https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-${GODOT_STATUS}/Godot_v${GODOT_VERSION}-${GODOT_STATUS}_linux.x86_64.zip"
+          echo "Downloading $URL"
+          curl -fSL "$URL" -o godot.zip
+          unzip -q godot.zip
+          mv "Godot_v${GODOT_VERSION}-${GODOT_STATUS}_linux.x86_64" godot
+          chmod +x godot
+          echo "$HOME/godot" >> "$GITHUB_PATH"
 
-          # Ensure debug keystore exists at a known path
-          KEYSTORE_PATH="$HOME/debug.keystore"
-          if [ -f /root/debug.keystore ]; then
-            cp /root/debug.keystore "$KEYSTORE_PATH"
-          fi
-          if [ ! -f "$KEYSTORE_PATH" ]; then
+      - name: Confirm Godot
+        run: |
+          "$HOME/godot/godot" --version
+
+      # --- Godot export templates -------------------------------------------
+      - name: Install Godot export templates
+        run: |
+          set -e
+          TPL_DIR="$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.${GODOT_STATUS}"
+          mkdir -p "$HOME/.local/share/godot/export_templates"
+          cd /tmp
+          URL="https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}-${GODOT_STATUS}/Godot_v${GODOT_VERSION}-${GODOT_STATUS}_export_templates.tpz"
+          echo "Downloading $URL"
+          curl -fSL "$URL" -o templates.tpz
+          unzip -q templates.tpz
+          # The archive contains a 'templates' directory
+          mv templates "$TPL_DIR"
+          echo "=== Installed templates ==="
+          ls -la "$TPL_DIR" | head -30
+
+      # --- Debug keystore ---------------------------------------------------
+      - name: Generate debug keystore
+        run: |
+          set -e
+          mkdir -p "$HOME/.android"
+          KS="$HOME/.android/debug.keystore"
+          if [ ! -f "$KS" ]; then
             keytool -keyalg RSA -genkeypair -alias androiddebugkey \
-              -keypass android -keystore "$KEYSTORE_PATH" \
+              -keypass android -keystore "$KS" \
               -storepass android -dname "CN=Android Debug,O=Android,C=US" \
               -validity 9999 -deststoretype pkcs12
           fi
-          echo "KEYSTORE_PATH=$KEYSTORE_PATH"
+          ls -la "$KS"
 
-          # Write a complete editor settings file with all paths Godot 4.3 needs.
-          # Use echo per-line so YAML indentation does NOT leak into the file content.
+      # --- Godot editor settings (export paths) -----------------------------
+      - name: Write Godot editor settings
+        run: |
+          set -e
+          mkdir -p "$HOME/.config/godot"
+          SETTINGS="$HOME/.config/godot/editor_settings-4.tres"
           {
             echo '[gd_resource type="EditorSettings" format=3]'
             echo ''
             echo '[resource]'
-            echo "export/android/android_sdk_path = \"${ANDROID_PATH}\""
-            echo "export/android/java_sdk_path = \"${JAVA_PATH}\""
-            echo "export/android/debug_keystore = \"${KEYSTORE_PATH}\""
+            echo "export/android/android_sdk_path = \"$ANDROID_HOME\""
+            echo "export/android/java_sdk_path = \"$JAVA_HOME\""
+            echo "export/android/debug_keystore = \"$HOME/.android/debug.keystore\""
             echo 'export/android/debug_keystore_user = "androiddebugkey"'
             echo 'export/android/debug_keystore_pass = "android"'
             echo 'export/android/force_system_user = false'
             echo 'export/android/shutdown_adb_on_exit = true'
-          } > ~/.config/godot/editor_settings-4.tres
-
-          echo "=== Final editor settings ==="
-          cat ~/.config/godot/editor_settings-4.tres
-
-      - name: Diagnostic — show environment
-        run: |
-          echo "=== Godot version ==="
-          godot --version || true
-          echo "=== HOME = $HOME ==="
+            echo 'export/android/one_click_deploy_clear_previous_install = false'
+            echo 'export/android/use_wifi_for_remote_debug = false'
+          } > "$SETTINGS"
           echo "=== Editor settings ==="
-          cat ~/.config/godot/editor_settings-4.tres 2>/dev/null || echo "MISSING"
-          echo "=== Export templates dir ==="
-          ls -la ~/.local/share/godot/export_templates/ 2>/dev/null || echo "MISSING"
-          echo "=== Android SDK ==="
-          ls -la ${ANDROID_HOME:-/usr/lib/android-sdk} 2>/dev/null | head -5 || echo "MISSING"
-          echo "=== Debug keystore ==="
-          ls -la ~/debug.keystore /root/debug.keystore 2>/dev/null || echo "MISSING"
-          echo "=== Project files ==="
-          ls -la
+          cat "$SETTINGS"
 
-      - name: Import project (first pass, warm cache)
+      # --- Project import ---------------------------------------------------
+      - name: Import project (warm caches)
         run: |
-          godot --headless --verbose --import 2>&1 | tail -100 || true
+          set +e
+          "$HOME/godot/godot" --headless --import 2>&1 | tee /tmp/import.log | tail -120
+          echo "godot exit=$?"
+          true
 
-      - name: Import project (second pass, fail on script errors)
+      - name: Fail if script errors detected during import
         run: |
           set -e
-          godot --headless --import 2>&1 | tee /tmp/import.log
-          if grep -E "SCRIPT ERROR|Parse Error|Failed to load" /tmp/import.log; then
-            echo "::error::Script parse errors detected — aborting before export"
+          if grep -E "(SCRIPT ERROR|Parse Error|Failed to load script|Cannot infer|No constructor|not found in base)" /tmp/import.log; then
+            echo "::error::GDScript parse/runtime errors above — aborting before export"
+            echo "=== Full import log tail ==="
+            tail -200 /tmp/import.log
+            exit 1
+          fi
+          echo "No GDScript errors detected in import log."
+
+      - name: Re-write editor settings (Godot may have overwritten)
+        run: |
+          set -e
+          SETTINGS="$HOME/.config/godot/editor_settings-4.tres"
+          {
+            echo '[gd_resource type="EditorSettings" format=3]'
+            echo ''
+            echo '[resource]'
+            echo "export/android/android_sdk_path = \"$ANDROID_HOME\""
+            echo "export/android/java_sdk_path = \"$JAVA_HOME\""
+            echo "export/android/debug_keystore = \"$HOME/.android/debug.keystore\""
+            echo 'export/android/debug_keystore_user = "androiddebugkey"'
+            echo 'export/android/debug_keystore_pass = "android"'
+            echo 'export/android/force_system_user = false'
+            echo 'export/android/shutdown_adb_on_exit = true'
+          } > "$SETTINGS"
+          echo "=== Editor settings (refreshed) ==="
+          cat "$SETTINGS"
+
+      # --- Sanity check -----------------------------------------------------
+      - name: Show export_presets.cfg
+        run: |
+          if [ -f export_presets.cfg ]; then
+            echo "=== export_presets.cfg ==="
+            cat export_presets.cfg
+          else
+            echo "::error::export_presets.cfg missing!"
             exit 1
           fi
 
+      # --- Export the APK ---------------------------------------------------
       - name: Export Android APK
-        shell: bash
         run: |
-          mkdir -v -p build
-          godot --headless --verbose --export-debug "Android" "$PWD/build/snake-aether.apk" 2>&1 | tee /tmp/export.log
+          set -e
+          mkdir -p build
+          "$HOME/godot/godot" --headless --verbose \
+            --export-debug "${PRESET_NAME}" "$PWD/build/${APK_NAME}" 2>&1 | tee /tmp/export.log
           GODOT_EXIT=${PIPESTATUS[0]}
+          echo ""
           echo "=== Export log tail ==="
-          tail -200 /tmp/export.log
+          tail -120 /tmp/export.log
+          echo ""
           echo "=== Build directory ==="
-          ls -lah build/
-          echo "Godot exit code: $GODOT_EXIT"
-          exit $GODOT_EXIT
+          ls -lah build/ || true
+          echo "Godot exit: $GODOT_EXIT"
+          if [ -f "build/${APK_NAME}" ] && [ $GODOT_EXIT -eq 0 ]; then
+            echo "APK built successfully."
+          else
+            echo "::error::APK build failed (godot exit=$GODOT_EXIT)"
+            exit ${GODOT_EXIT:-1}
+          fi
 
-      - name: Upload APK artifact
+      # --- Upload artifacts -------------------------------------------------
+      - name: Upload APK
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: snake-aether-apk
-          path: build/snake-aether.apk
+          path: build/*.apk
           if-no-files-found: warn
 
-      - name: Upload logs (for debugging)
-        if: failure()
+      - name: Upload logs
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: build-logs

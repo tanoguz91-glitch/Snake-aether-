@@ -1,0 +1,90 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  export:
+    name: Build Snake Aether APK
+    runs-on: ubuntu-latest
+    container:
+      image: barichello/godot-ci:4.3
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Godot environment
+        run: |
+          mkdir -v -p ~/.local/share/godot/export_templates
+          mkdir -v -p ~/.config/godot
+          if [ -d /root/.local/share/godot/export_templates/4.3.stable ]; then
+            cp -r /root/.local/share/godot/export_templates/4.3.stable ~/.local/share/godot/export_templates/
+          fi
+          if [ -f /root/.config/godot/editor_settings-4.tres ]; then
+            cp /root/.config/godot/editor_settings-4.tres ~/.config/godot/
+          fi
+          # Make debug keystore reachable
+          if [ -f /root/debug.keystore ]; then
+            cp /root/debug.keystore ~/debug.keystore
+          fi
+
+      - name: Diagnostic — show environment
+        run: |
+          echo "=== Godot version ==="
+          godot --version || true
+          echo "=== HOME = $HOME ==="
+          echo "=== Editor settings ==="
+          cat ~/.config/godot/editor_settings-4.tres 2>/dev/null || echo "MISSING"
+          echo "=== Export templates dir ==="
+          ls -la ~/.local/share/godot/export_templates/ 2>/dev/null || echo "MISSING"
+          echo "=== Android SDK ==="
+          ls -la ${ANDROID_HOME:-/usr/lib/android-sdk} 2>/dev/null | head -5 || echo "MISSING"
+          echo "=== Debug keystore ==="
+          ls -la ~/debug.keystore /root/debug.keystore 2>/dev/null || echo "MISSING"
+          echo "=== Project files ==="
+          ls -la
+
+      - name: Import project (first pass, warm cache)
+        run: |
+          godot --headless --verbose --import 2>&1 | tail -100 || true
+
+      - name: Import project (second pass, fail on script errors)
+        run: |
+          set -e
+          godot --headless --import 2>&1 | tee /tmp/import.log
+          if grep -E "SCRIPT ERROR|Parse Error|Failed to load" /tmp/import.log; then
+            echo "::error::Script parse errors detected — aborting before export"
+            exit 1
+          fi
+
+      - name: Export Android APK
+        run: |
+          mkdir -v -p build
+          set -o pipefail
+          godot --headless --verbose --export-debug "Android" "$PWD/build/snake-aether.apk" 2>&1 | tee /tmp/export.log
+          echo "=== Export log tail ==="
+          tail -200 /tmp/export.log
+          echo "=== Build directory ==="
+          ls -lah build/
+
+      - name: Upload APK artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: snake-aether-apk
+          path: build/snake-aether.apk
+          if-no-files-found: warn
+
+      - name: Upload logs (for debugging)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            /tmp/import.log
+            /tmp/export.log
+          if-no-files-found: ignore
